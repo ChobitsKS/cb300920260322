@@ -1,0 +1,238 @@
+/**
+ * 1. ฟังก์ชันสร้าง Collection ใน Qdrant (รันแค่นั่งครั้งแรกครั้งเดียว)
+ */
+function setupQdrantCollection() {
+  const qdrantUrl = getConfig("QDRANT_URL", "");
+  const qdrantApiKey = getConfig("QDRANT_API_KEY", "");
+  const collectionName = "tcas_documents";
+
+  const url = qdrantUrl + "/collections/" + collectionName;
+  
+  const payload = {
+    vectors: {
+      size: 1536, // ขนาด Vector สำหรับ OpenAI text-embedding-3-small
+      distance: "Cosine"
+    }
+  };
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "put",
+    contentType: "application/json",
+    headers: { "api-key": qdrantApiKey },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  Logger.log("Setup Collection Status: " + res.getResponseCode());
+  Logger.log("Response: " + res.getContentText());
+}
+
+/**
+ * 2. ฟังก์ชันแปลงข้อความให้เป็น Vector ผ่าน OpenAI Embedding API
+ */
+function getEmbedding(text) {
+  const apiKey = getConfig("OPENAI_API_KEY", "");
+  const url = "https://api.openai.com/v1/embeddings";
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    headers: { Authorization: "Bearer " + apiKey },
+    payload: JSON.stringify({
+      model: "text-embedding-3-small",
+      input: text
+    }),
+    muteHttpExceptions: true
+  });
+
+  const data = JSON.parse(res.getContentText() || "{}");
+  return data.data?.[0]?.embedding || null;
+}
+
+/**
+ * 3. ฟังก์ชันอัปโหลดเนื้อหาเข้าสู่ Qdrant (ใช้แทนการ Upload เข้า OpenAI Vector Store)
+ */
+function uploadChunkToQdrant(pointId, text, metadata) {
+  const qdrantUrl = getConfig("QDRANT_URL", "");
+  const qdrantApiKey = getConfig("QDRANT_API_KEY", "");
+  const collectionName = "tcas_documents";
+
+  // สร้าง Vector จากข้อความ
+  const vector = getEmbedding(text);
+  if (!vector) {
+    Logger.log("❌ ไม่สามารถสร้าง Embedding ได้");
+    return;
+  }
+
+  const url = qdrantUrl + "/collections/" + collectionName + "/points";
+  
+  const payload = {
+    points: [
+      {
+        id: pointId, // ตัวเลข เช่น 1, 2, 3 หรือ UUID
+        vector: vector,
+        payload: {
+          text: text,
+          filename: metadata.filename || "",
+          program_name: metadata.program_name || "",
+          year: metadata.year || 2568
+        }
+      }
+    ]
+  };
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "put",
+    contentType: "application/json",
+    headers: { "api-key": qdrantApiKey },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  Logger.log("Upload Status: " + res.getResponseCode());
+  Logger.log("Response: " + res.getContentText());
+}
+
+/**
+ * 4. ฟังก์ชันค้นหาข้อมูลจาก Qdrant (ใช้แทน buildVectorContext เดิม)
+ */
+function buildVectorContextFromQdrant(userQuery) {
+  const qdrantUrl = getConfig("QDRANT_URL", "");
+  const qdrantApiKey = getConfig("QDRANT_API_KEY", "");
+  const collectionName = "tcas_documents";
+
+  if (!userQuery || !qdrantApiKey || !qdrantUrl) return "";
+
+  // 1. แปลงคำถามเป็น Vector
+  const queryVector = getEmbedding(userQuery);
+  if (!queryVector) return "";
+
+  // 2. ส่ง Search Request ไปยัง Qdrant REST API
+  const searchUrl = qdrantUrl + "/collections/" + collectionName + "/points/search";
+  
+  const searchPayload = {
+    vector: queryVector,
+    limit: 3,             // ดึง 3 ผลลัพธ์ที่ดีที่สุด
+    with_payload: true,   // เอาข้อความและ Metadata กลับมาด้วย
+    score_threshold: 0.35 // กำหนด Score ความเหมือนขั้นต่ำ
+  };
+
+  const res = UrlFetchApp.fetch(searchUrl, {
+    method: "post",
+    contentType: "application/json",
+    headers: { "api-key": qdrantApiKey },
+    payload: JSON.stringify(searchPayload),
+    muteHttpExceptions: true
+  });
+
+  const data = JSON.parse(res.getContentText() || "{}");
+  const results = data.result || [];
+
+  if (!results.length) return "";
+
+  // 3. จัด Format Context ส่งกลับไปให้ LLM อ่าน
+  return results.map((item, index) => {
+    const payload = item.payload || {};
+    return [
+      "===== ข้อมูลอ้างอิงที่ " + (index + 1) + " =====",
+      "โครงการ/หลักสูตร: " + (payload.program_name || payload.filename || "ไม่ระบุ"),
+      "เนื้อหา:",
+      payload.text || "",
+      "=================================="
+    ].join("\n");
+  }).join("\n\n");
+}
+
+/**
+ * 1. ฟังก์ชันแปลงไฟล์ PDF ใน Drive เป็นข้อความ (Text)
+ */
+function extractTextFromPdf(fileId) {
+  try {
+    // สร้างไฟล์ Google Doc ชั่วคราวโดยให้ Drive API ช่วยแปลง PDF เป็น Text (OCR)
+    const blob = DriveApp.getFileById(fileId).getBlob();
+    const resource = {
+      title: "temp_pdf_extract",
+      mimeType: MimeType.GOOGLE_DOCS
+    };
+
+    // ใช้ Drive API ในการแปลง
+    const tempFile = Drive.Files.insert(resource, blob);
+    const doc = DocumentApp.openById(tempFile.id);
+    const text = doc.getBody().getText();
+
+    // ลบไฟล์ Google Doc ชั่วคราวนั้นทิ้งทันที
+    DriveApp.getFileById(tempFile.id).setTrashed(true);
+
+    return text;
+  } catch (err) {
+    Logger.log("❌ Error Extracting PDF: " + err);
+    return "";
+  }
+}
+
+/**
+ * 2. ฟังก์ชันหลัก: อ่าน PDF จาก Drive -> แบ่ง Chunks -> ส่งขึ้น Qdrant
+ */
+/**
+ * ฟังก์ชันอ่านไฟล์ PDF ทุกไฟล์ในโฟลเดอร์แล้วส่งขึ้น Qdrant
+ */
+function processFolderToQdrant() {
+  // 📌 ใส่ Folder ID ของโฟลเดอร์ที่เก็บไฟล์ PDF ใน Google Drive
+  // (ดูได้จาก URL โฟลเดอร์: https://drive.google.com/drive/folders/【FOLDER_ID】)
+  const folderId = "1iLKhzbosnV42fiji2pPryfi7TBh_hby4"; 
+  
+  const folder = DriveApp.getFolderById(folderId);
+  const files = folder.getFilesByType(MimeType.PDF);
+  
+  let totalFiles = 0;
+
+  while (files.hasNext()) {
+    const file = files.next();
+    const fileId = file.getId();
+    const fileName = file.getName();
+    
+    // ตั้งชื่อโครงการเริ่มต้นตามชื่อไฟล์ (ตัด .pdf ออก)
+    const programName = fileName.replace(/\.pdf$/i, "");
+
+    Logger.log("========================================");
+    Logger.log("📁 กำลังประมวลผลไฟล์: " + fileName);
+    Logger.log("========================================");
+
+    const rawText = extractTextFromPdf(fileId);
+
+    if (!rawText) {
+      Logger.log("⚠️ ไม่อาจดึงข้อความจากไฟล์ " + fileName + " ได้ (อาจเป็นไฟล์สแกนรูปภาพ)");
+      continue;
+    }
+
+    const paragraphs = rawText.split("\n\n");
+    let startId = Date.now();
+    let uploadedCount = 0;
+
+    paragraphs.forEach((pText, index) => {
+      const cleanText = pText.trim();
+
+      if (cleanText.length > 30) {
+        const pointId = startId + index;
+
+        uploadChunkToQdrant(
+          pointId,
+          cleanText,
+          {
+            filename: fileName,
+            program_name: programName, // ใช้ชื่อไฟล์เป็นชื่อโครงการอัตโนมัติ
+            year: 2568
+          }
+        );
+
+        uploadedCount++;
+        Utilities.sleep(200); // ชะลอเพื่อป้องกัน Rate Limit
+      }
+    });
+
+    Logger.log("✅ ไฟล์ " + fileName + " เสร็จสิ้น (รวม " + uploadedCount + " Chunks)");
+    totalFiles++;
+  }
+
+  Logger.log("🎉 ประมวลผลครบทุกไฟล์ในโฟลเดอร์แล้ว! รวมทั้งหมด " + totalFiles + " ไฟล์");
+}
